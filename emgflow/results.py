@@ -6,6 +6,7 @@ see is what the scripted run produces. Folder names here mirror io_utils.build_o
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,8 @@ from pathlib import Path
 import mne
 import numpy as np
 import pandas as pd
+
+from src.neurosoft import CONDITION, SCENARIOS
 
 SIR_DIR = "Stimulation-induced responses"
 SS_DIR = "StartStop analysis"
@@ -78,31 +81,76 @@ class ProcessedRun:
         return {"sir": "crops", "condition": "ISI"}.get(self.mode, "conditions")
 
 
+#: Which mode a recorded Neurosoft scenario belongs to. Built off ``SCENARIOS``
+#: so a scenario added there cannot be forgotten here; only the Condition test
+#: writes its own output tree, the rest are SIR deliverables.
+_MODE_OF_SCENARIO = {s: ("condition" if s == CONDITION else "sir") for s in SCENARIOS}
+
+
+def _recorded_mode(root: Path) -> str | None:
+    """The mode the LAST run recorded in ``review/run.json``, or None.
+
+    None covers a run made before the manifest existed, and equally a run that
+    carries no scenario at all — a plain SIR or StartStop recording, which the
+    manifest cannot tell apart and the content probes can.
+    """
+    p = Path(root) / "review" / "run.json"
+    if not p.exists():
+        return None
+    try:
+        scen = json.loads(p.read_text(encoding="utf-8")).get("scenario")
+    except Exception:
+        return None
+    return _MODE_OF_SCENARIO.get(scen)
+
+
 def detect_mode(root: Path) -> str | None:
     """Which mode produced this output root — judged by CONTENT, not by folder names.
 
     Folders are created lazily now (a SIR run no longer leaves an empty
     'StartStop analysis/' behind), but content remains the safer test: older
     output roots on disk still carry both empty trees.
+
+    Content alone cannot say which of two analyses is CURRENT, though, and a
+    re-run under a corrected scenario leaves both on disk: the cleanup at the end
+    of a run removes the other scenarios' deliverables, not another mode's files,
+    and the Condition test is not a SIR scenario. So a file first misclassified
+    as a Condition test kept its ``condition_summary.csv`` sitting in a flat
+    ``results/`` while the corrected SIR run nested itself under
+    ``Stimulation-induced responses/`` beside it — and since Condition was probed
+    first, every later open of that folder reopened the wrong, superseded tab.
+    The run manifest is rewritten on every run (see ``write_run_manifest``), so
+    it settles the order; the probes still decide, and a run that recorded a mode
+    but wrote nothing still reads as empty rather than as that mode.
     """
     root = Path(root)
+
+    def has_condition() -> bool:
+        cond = mode_dir(root, COND_DIR)
+        cond_wf = cond / "Waterfall"
+        return (cond / "Excel" / "condition_summary.csv").exists() or (
+            cond_wf.exists() and any(cond_wf.glob("*.png")))
+
+    def has_sir() -> bool:
+        sir_epochs = mode_dir(root, SIR_DIR) / "Stimulus-centered epochs"
+        return sir_epochs.exists() and any(sir_epochs.glob("*-epo.fif"))
+
+    def has_startstop() -> bool:
+        ss_raw = mode_dir(root, SS_DIR) / "Detections raw"
+        return ss_raw.exists() and any(ss_raw.glob("*.fif"))
+
+    probes = {"condition": has_condition, "sir": has_sir, "startstop": has_startstop}
     # Condition test is a distinct output tree (no SIR epochs, no StartStop fif),
-    # so probe it first by its own summary CSV / plots.
-    cond = mode_dir(root, COND_DIR)
-    cond_wf = cond / "Waterfall"
-    if (cond / "Excel" / "condition_summary.csv").exists() or (
-            cond_wf.exists() and any(cond_wf.glob("*.png"))):
-        return "condition"
-
-    sir = mode_dir(root, SIR_DIR)
-    sir_epochs = sir / "Stimulus-centered epochs"
-    if (sir_epochs.exists() and any(sir_epochs.glob("*-epo.fif"))):
-        return "sir"
-
-    ss = mode_dir(root, SS_DIR)
-    ss_raw = ss / "Detections raw"
-    if (ss_raw.exists() and any(ss_raw.glob("*.fif"))):
-        return "startstop"
+    # so probe it first by its own summary CSV / plots — unless the manifest says
+    # this root was last produced by something else.
+    order = ["condition", "sir", "startstop"]
+    recorded = _recorded_mode(root)
+    if recorded is not None:
+        order.remove(recorded)
+        order.insert(0, recorded)
+    for mode in order:
+        if probes[mode]():
+            return mode
 
     # Metrics CSV alone: both modes write the same file name, so it can only
     # disambiguate when the mode folder is present.
